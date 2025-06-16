@@ -1,0 +1,6 @@
+/r*
+/debug
+/release
+/.gdb_history
+/perf*
+/gecko*

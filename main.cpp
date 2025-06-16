@@ -1,11 +1,11 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_render.h>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <immintrin.h>
 #include <new>
 #include <raylib.h>
-#include <utility>
 
 struct AliveParticle {
   Vector2 position;
@@ -39,27 +39,20 @@ struct Particles {
   std::size_t aliveCount = 0;
   std::size_t aliveBufferSize = 0;
 
-  DyingParticle *deadBuffer = nullptr;
+  float *deadLifetimeBuffer = nullptr;
   std::size_t deadCount = 0;
   std::size_t deadBufferSize = 0;
+
+  float *tmpstorage = nullptr;
+  std::size_t tmpstorageSize = 0;
 
   void run(float deltaTime) {
     auto newDeadCount = 0;
 
     {
-      auto d = _mm256_set1_ps(deltaTime);
       auto i = 0;
+      auto d = _mm256_set1_ps(deltaTime);
       for (; i + 8 <= aliveCount; i += 8) {
-        // The bottleneck is memory access (writes), and port utilisation. cf
-        // vtune, perf mem, perf
-        // I should overclock my RAM...
-        // Still.. it's strange, vtune reports a bandwidth of 26GB/s
-        // But i found that i am using 13GB/s of memory bandwidth
-        // 8GB/s for the writes, and 5GB/s for the reads.
-        // (2e8 particles~, 5 floats read, 3 floats written, 45ms per frame)
-        // It's not the only program on the system but i doubt my system uses
-        // 13Gb/s of memory bandwidth idle
-        // After testing, vtune reports 0.021 GB/s of memory bandwidth Idle
         __m256 posx = _mm256_load_ps(alivePosxBuffer + i);
         __m256 velx = _mm256_load_ps(aliveVelxBuffer + i);
 
@@ -89,56 +82,70 @@ struct Particles {
         // If the death rate is low,
         // this is probably better... we pay for a branch misprediction and
         // maybe a cache miss at each dead particle...
-        if (deadMask != 0) {
-          for (int j = 0; j < 8; ++j) {
-            if (deadMask & (1 << j)) {
-              std::swap(alivePosxBuffer[i + j], alivePosxBuffer[aliveCount]);
-              std::swap(alivePosyBuffer[i + j], alivePosyBuffer[aliveCount]);
-              std::swap(aliveVelxBuffer[i + j], aliveVelxBuffer[aliveCount]);
-              std::swap(aliveVelyBuffer[i + j], aliveVelyBuffer[aliveCount]);
-              std::swap(aliveLifetimeBuffer[i + j],
-                        aliveLifetimeBuffer[aliveCount]);
-              --aliveCount;
-              newDeadCount++;
-            }
-          }
-        }
+        newDeadCount += __builtin_popcount(deadMask);
       }
 
       for (; i < aliveCount; ++i) {
-
         alivePosxBuffer[i] += aliveVelxBuffer[i] * deltaTime;
         alivePosyBuffer[i] += aliveVelyBuffer[i] * deltaTime;
 
         if ((aliveLifetimeBuffer[i] -= deltaTime) <= 0) {
-          std::swap(alivePosxBuffer[i], alivePosxBuffer[aliveCount]);
-          std::swap(alivePosyBuffer[i], alivePosyBuffer[aliveCount]);
-          std::swap(aliveVelxBuffer[i], aliveVelxBuffer[aliveCount]);
-          std::swap(aliveVelyBuffer[i], aliveVelyBuffer[aliveCount]);
-          std::swap(aliveLifetimeBuffer[i], aliveLifetimeBuffer[aliveCount]);
-
-          // TODO: UB if i == 0
-          --i;
-          aliveCount--;
           newDeadCount++;
         }
       }
     }
 
     if (newDeadCount > 0) {
+      if (tmpstorageSize < newDeadCount * 5) {
+        tmpstorageSize = newDeadCount * 5;
+        float *newStorage = new float[tmpstorageSize];
+        delete[] tmpstorage;
+        tmpstorage = newStorage;
+      }
+      // First move the last N alive particles into a temporary buffer
+      auto i = aliveBufferSize - 1;
+      for (auto j = 0; j < newDeadCount;) {
+        if (i == 0) {
+          break;
+        }
+        if (aliveLifetimeBuffer[i] > 0) {
+          tmpstorage[j * 5 + 0] = alivePosxBuffer[i];
+          tmpstorage[j * 5 + 1] = alivePosyBuffer[i];
+          tmpstorage[j * 5 + 2] = aliveVelxBuffer[i];
+          tmpstorage[j * 5 + 3] = aliveVelyBuffer[i];
+          tmpstorage[j * 5 + 4] = aliveLifetimeBuffer[i];
+          j++;
+        }
+        i--;
+      }
+
       if (deadBufferSize < deadCount + newDeadCount) {
         deadBufferSize = (deadCount + newDeadCount) * 2;
-        DyingParticle *newBuffer = new DyingParticle[deadBufferSize];
-        std::memcpy(newBuffer, deadBuffer, deadCount * sizeof(DyingParticle));
-        delete[] deadBuffer;
-        deadBuffer = newBuffer;
+        float *newBuffer =
+            new (std::align_val_t(alignof(__m256))) float[deadBufferSize];
+        delete[] deadLifetimeBuffer;
+        deadLifetimeBuffer = newBuffer;
       }
-      for (std::size_t i = 0; i < newDeadCount; ++i) {
-        deadBuffer[deadCount++] = {
-            {alivePosxBuffer[aliveCount + i], alivePosyBuffer[aliveCount + i]},
-            aliveLifetimeBuffer[aliveCount + i],
-        };
+
+      // Then remove the dead particles from the alive buffers and replace them
+      // with the last N alive particles
+      auto j = 0;
+      for (std::size_t i = 0; i < aliveBufferSize; ++i) {
+        if (j >= newDeadCount) {
+          break;
+        }
+        deadLifetimeBuffer[deadCount + j] = aliveLifetimeBuffer[i];
+
+        alivePosxBuffer[i] = tmpstorage[j * 5 + 0];
+        alivePosyBuffer[i] = tmpstorage[j * 5 + 1];
+        aliveVelxBuffer[i] = tmpstorage[j * 5 + 2];
+        aliveVelyBuffer[i] = tmpstorage[j * 5 + 3];
+        aliveLifetimeBuffer[i] = tmpstorage[j * 5 + 4];
+        j++;
       }
+
+      aliveCount -= newDeadCount;
+      deadCount += newDeadCount;
     }
 
     for (auto i = 0; i < spawnerCount; ++i) {
@@ -150,7 +157,7 @@ struct Particles {
                             SDL_randf() * 100.0f - 50.0f};
 
         if (aliveBufferSize <= aliveCount) {
-          aliveBufferSize = aliveBufferSize == 0 ? 1 : aliveBufferSize * 2;
+          aliveBufferSize = (aliveCount + aliveBufferSize) * 2;
           float *newBuffer =
               new (std::align_val_t(alignof(__m256))) float[aliveBufferSize];
           std::memcpy(newBuffer, alivePosxBuffer, aliveCount * sizeof(float));
@@ -192,12 +199,16 @@ struct Particles {
       }
     }
 
-    for (std::size_t i = 0; i < deadCount; ++i) {
-      auto &particle = deadBuffer[i];
-      particle.lifetime -= deltaTime;
-      if (particle.lifetime <= 0) {
-        std::swap(particle, deadBuffer[--deadCount]);
-        --i;
+    {
+      for (std::size_t i = 0; i < deadCount; ++i) {
+        auto &lifetime = deadLifetimeBuffer[i];
+        lifetime -= deltaTime;
+
+        if (lifetime <= 0) {
+          deadLifetimeBuffer[i] = deadLifetimeBuffer[deadCount - 1];
+          deadCount--;
+          i--;
+        }
       }
     }
   }
@@ -315,10 +326,12 @@ int main(int argc, char *argv[]) {
 
     SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
     char buffer[256];
-    std::snprintf(buffer, 256, "Alive: %zu, Dead: %zu\ndt: %.02fms",
-                  particles.aliveCount, particles.deadCount,
-                  delta_time * 1000.f);
-    SDL_RenderDebugText(renderer, 0, 0, buffer);
+    std::snprintf(
+        buffer, 256, "Alive: %zu Dead: %zu, \ndt: %.02fms, log alive(10): %.1f",
+        particles.aliveCount, particles.deadCount, delta_time * 1000.f,
+
+        std::log(particles.aliveCount) / std::log(10));
+    SDL_RenderDebugText(renderer, 10, 10, buffer);
     SDL_RenderPresent(renderer);
     SDL_UpdateWindowSurface(window);
   }
@@ -330,7 +343,6 @@ int main(int argc, char *argv[]) {
   delete[] particles.aliveVelxBuffer;
   delete[] particles.aliveVelyBuffer;
   delete[] particles.aliveLifetimeBuffer;
-  delete[] particles.deadBuffer;
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);
   return 0;
